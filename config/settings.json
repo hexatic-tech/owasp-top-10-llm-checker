@@ -1,0 +1,6 @@
+{
+  "timeout_seconds": 30,
+  "delay_between_tests_seconds": 2,
+  "max_crawl_pages": 12,
+  "enable_browser_scan": true
+}
