@@ -1,12 +1,12 @@
 # OWASP LLM Top 10 Payload Tester
 
-Python desktop application for authorized OWASP LLM Top 10 testing of your own LLM-powered website or API.
+Python desktop application for OWASP LLM Top 10 testing of your own LLM-powered website or API.
 
 > Use this tool only on systems you own or have explicit permission to test.
 
 ## Setup
 
-Requires Python 3.11+.
+Requires Python 3.12+. 
 
 ```bash
 pip install -r requirements.txt

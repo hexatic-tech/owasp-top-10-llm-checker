@@ -1,5 +1,5 @@
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -13,7 +13,7 @@ class PayloadCase:
     payload_text: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class ScanResult:
     target_url: str
     timestamp: str
@@ -33,4 +33,5 @@ class ScanResult:
 
 
 def utc_timestamp() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    """Current UTC time as an ISO-8601 string, e.g. '2026-06-15T12:00:00Z'."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")

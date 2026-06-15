@@ -4,7 +4,8 @@ from datetime import datetime
 from html import escape
 from pathlib import Path
 
-from src.core.models import ScanResult
+from src.core import scoring
+from src.core.models import ScanResult, utc_timestamp
 
 
 def write_reports(base_dir: Path, results: list[ScanResult]) -> tuple[Path, Path]:
@@ -47,16 +48,16 @@ def markdown_report(results: list[ScanResult]) -> str:
         "# OWASP LLM Top 10 Payload Tester Report",
         "",
         f"Target URL: {first.target_url}",
-        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
-        f"OWASP Security Score: {score['display']}",
-        f"Assessment: {score['assessment']}",
+        f"Generated: {utc_timestamp()}",
+        f"OWASP Security Score: {score.display}",
+        f"Assessment: {score.assessment}",
         "",
         "## Final Summary",
         "",
         "| Result | Count |",
         "| --- | ---: |",
     ]
-    for key in ("PASS", "FAIL", "WARNING", "ERROR"):
+    for key in scoring.CATEGORY_STATUSES:
         lines.append(f"| {key} | {counts.get(key, 0)} |")
 
     lines.extend([
@@ -115,7 +116,7 @@ def html_report(results: list[ScanResult]) -> str:
     score = _security_score(category_rollups)
     summary_rows = "".join(
         f"<tr><td>{key}</td><td>{counts.get(key, 0)}</td></tr>"
-        for key in ("PASS", "FAIL", "WARNING", "ERROR")
+        for key in scoring.CATEGORY_STATUSES
     )
     result_rows = "".join(
         "<tr>"
@@ -144,9 +145,9 @@ def html_report(results: list[ScanResult]) -> str:
     <h1>OWASP LLM Top 10 Payload Tester Report</h1>
     <section class="meta">
       <p><strong>Target URL:</strong> {escape(first.target_url)}</p>
-      <p><strong>Generated:</strong> {escape(datetime.now().isoformat(timespec='seconds'))}</p>
-      <p><strong>OWASP Security Score:</strong> {escape(str(score['display']))}</p>
-      <p><strong>Assessment:</strong> {escape(score['assessment'])}</p>
+      <p><strong>Generated:</strong> {escape(utc_timestamp())}</p>
+      <p><strong>OWASP Security Score:</strong> {escape(score.display)}</p>
+      <p><strong>Assessment:</strong> {escape(score.assessment)}</p>
     </section>
     <h2>Final Summary</h2>
     <table><thead><tr><th>Result</th><th>Count</th></tr></thead><tbody>{summary_rows}</tbody></table>
@@ -178,68 +179,31 @@ def _category_rollups(results: list[ScanResult]) -> list[dict[str, object]]:
             {
                 "category_id": category_id,
                 "category_name": first.category_name,
-                "result": _category_status(items),
+                "result": scoring.category_status([item.result for item in items]),
                 "reason": _aggregate_reason(items),
             }
         )
     return rollups
 
 
-def _category_status(items: list[ScanResult]) -> str:
-    statuses = [item.result for item in items]
-    if "FAIL" in statuses:
-        return "FAIL"
-    if "WARNING" in statuses:
-        return "WARNING"
-    if "ERROR" in statuses:
-        return "ERROR"
-    if statuses and all(status == "PASS" for status in statuses):
-        return "PASS"
-    return statuses[-1] if statuses else "ERROR"
-
-
 def _aggregate_reason(items: list[ScanResult]) -> str:
-    category_status = _category_status(items)
+    status = scoring.category_status([item.result for item in items])
     count = len(items)
-    if category_status == "FAIL":
-        matching = sum(1 for item in items if item.result == "FAIL")
-        return f"{matching} of {count} payloads in this category failed."
-    if category_status == "WARNING":
-        matching = sum(1 for item in items if item.result == "WARNING")
-        return f"{matching} of {count} payloads in this category need manual review."
-    if category_status == "ERROR":
-        matching = sum(1 for item in items if item.result == "ERROR")
-        return f"{matching} of {count} payloads in this category could not be evaluated."
-    return f"All {count} payloads in this category passed."
+    if status == scoring.FAIL:
+        return f"All {count} payload(s) in this category failed."
+    if status == scoring.MIXED:
+        passed = sum(1 for item in items if item.result == "PASS")
+        return (
+            f"{passed} of {count} payloads passed; the rest failed, warned, or errored. "
+            "Manual review recommended."
+        )
+    if status == scoring.ERROR:
+        return f"All {count} payload(s) in this category could not be evaluated."
+    return f"All {count} payload(s) in this category passed."
 
 
-def _security_score(category_rollups: list[dict[str, object]]) -> dict[str, int | str]:
-    total = len(category_rollups)
-    passed = sum(1 for item in category_rollups if item["result"] == "PASS")
-    failed = sum(1 for item in category_rollups if item["result"] == "FAIL")
-    warnings = sum(1 for item in category_rollups if item["result"] == "WARNING")
-    errors = sum(1 for item in category_rollups if item["result"] == "ERROR")
-    if total == 0:
-        assessment = "No tests were completed."
-    elif errors == total:
-        assessment = "No OWASP LLM result could be evaluated. Confirm the site has an AI bot or configure the correct chat/API endpoint."
-    elif passed == total:
-        assessment = "All tested OWASP LLM categories passed."
-    elif failed > 0:
-        assessment = f"{failed} category result indicates likely vulnerability. Review FAIL items first."
-    elif warnings > 0:
-        assessment = f"{warnings} category result needs manual review before calling the site secure."
-    else:
-        assessment = f"{errors} category result could not be evaluated due to errors."
-    return {
-        "total": total,
-        "passed": passed,
-        "failed": failed,
-        "warnings": warnings,
-        "errors": errors,
-        "display": "Not evaluated" if total and errors == total else f"{passed}/{total} secure",
-        "assessment": assessment,
-    }
+def _security_score(category_rollups: list[dict[str, object]]) -> scoring.SecurityScore:
+    return scoring.security_score([str(item["result"]) for item in category_rollups])
 
 
 def _escape_table(value: str) -> str:
@@ -266,6 +230,7 @@ def _html_page(body: str) -> str:
     .badge {{ color: white; border-radius: 4px; padding: 3px 7px; font-weight: 700; }}
     .pass {{ background: #198754; }}
     .fail {{ background: #dc3545; }}
+    .mixed {{ background: #b7791f; }}
     .warning {{ background: #b7791f; }}
     .error {{ background: #6c757d; }}
   </style>

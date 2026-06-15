@@ -1,0 +1,3 @@
+
+[notice] A new release of pip is available: 25.3 -> 26.1.2
+[notice] To update, run: D:\org\hexatic\projects\owasp-top-10-llm-checker\venv\Scripts\python.exe -m pip install --upgrade pip

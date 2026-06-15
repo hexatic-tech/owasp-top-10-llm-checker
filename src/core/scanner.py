@@ -16,6 +16,14 @@ from src.core.payload_loader import load_payload_cases
 
 CHAT_FIELD_HINTS = ("chat", "message", "prompt", "query", "question", "ask", "text", "input")
 
+# Browser-scan tuning (all milliseconds unless noted).
+NETWORKIDLE_TIMEOUT_MS = 10_000
+BODY_READ_TIMEOUT_MS = 5_000
+RESPONSE_POLL_INTERVAL_MS = 1_000
+RESPONSE_POLL_TICKS = 20  # max ticks to wait for a streamed reply (~20s)
+RESPONSE_STABLE_TICKS = 2  # consecutive identical reads that mean "done streaming"
+STOP_CHECK_INTERVAL_S = 0.2  # granularity of cooperative stop checks during sleeps
+
 
 def build_request_body(case: PayloadCase) -> dict[str, str]:
     """Customize this fallback if your target API expects another JSON schema."""
@@ -82,6 +90,7 @@ class AsyncScanner:
         delay_seconds: int = 2,
         max_crawl_pages: int = 12,
         enable_browser_scan: bool = True,
+        selected_category_ids: list[str] | None = None,
         on_log: Callable[[str], None] | None = None,
         on_website_status: Callable[[str, bool], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
@@ -93,6 +102,7 @@ class AsyncScanner:
         self.delay_seconds = delay_seconds
         self.max_crawl_pages = max_crawl_pages
         self.enable_browser_scan = enable_browser_scan
+        self.selected_category_ids = selected_category_ids or None
         self.on_log = on_log or (lambda _: None)
         self.on_website_status = on_website_status or (lambda _message, _ok: None)
         self.on_progress = on_progress or (lambda _current, _total: None)
@@ -102,8 +112,19 @@ class AsyncScanner:
     def stop(self) -> None:
         self._stop_requested = True
 
+    async def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleep in short slices so a stop request takes effect promptly."""
+        remaining = seconds
+        while remaining > 0 and not self._stop_requested:
+            await asyncio.sleep(min(STOP_CHECK_INTERVAL_S, remaining))
+            remaining -= STOP_CHECK_INTERVAL_S
+
     async def run(self) -> list[ScanResult]:
         cases = load_payload_cases(self.base_dir)
+        if self.selected_category_ids:
+            selected = set(self.selected_category_ids)
+            cases = [case for case in cases if case.category_id in selected]
+            self.on_log(f"Running {len(cases)} selected OWASP categor{'y' if len(cases) == 1 else 'ies'}.")
         results: list[ScanResult] = []
 
         async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
@@ -151,7 +172,9 @@ class AsyncScanner:
 
                     try:
                         if browser_session:
-                            status_code, raw_response = await browser_session.submit(case.payload_text)
+                            status_code, raw_response = await browser_session.submit(
+                                case.payload_text, should_stop=lambda: self._stop_requested
+                            )
                         else:
                             response = await self._send_payload(client, case, bot_target)
                             status_code = response.status_code
@@ -181,7 +204,7 @@ class AsyncScanner:
                     self.on_progress(index, len(cases))
 
                     if index < len(cases) and not self._stop_requested:
-                        await asyncio.sleep(self.delay_seconds)
+                        await self._interruptible_sleep(self.delay_seconds)
             finally:
                 if browser_session:
                     await browser_session.close()
@@ -363,6 +386,7 @@ class ScannerThread(QThread):
         delay_seconds: int,
         max_crawl_pages: int,
         enable_browser_scan: bool,
+        selected_category_ids: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.scanner = AsyncScanner(
@@ -372,6 +396,7 @@ class ScannerThread(QThread):
             delay_seconds=delay_seconds,
             max_crawl_pages=max_crawl_pages,
             enable_browser_scan=enable_browser_scan,
+            selected_category_ids=selected_category_ids,
             on_log=self.log.emit,
             on_website_status=self.website_status.emit,
             on_progress=self.progress.emit,
@@ -474,21 +499,46 @@ class BrowserBotSession:
                 continue
         return None
 
-    async def submit(self, payload: str) -> tuple[int, str]:
-        before_text = await self.page.locator("body").inner_text(timeout=5000)
+    async def submit(self, payload: str, should_stop: Callable[[], bool] | None = None) -> tuple[int, str]:
+        should_stop = should_stop or (lambda: False)
+        before_text = await self.page.locator("body").inner_text(timeout=BODY_READ_TIMEOUT_MS)
+        before_lines = set(self._significant_lines(before_text, payload))
+
         await self.input_locator.fill(payload)
         await self.input_locator.focus()
         await self._submit_current_input()
         try:
-            await self.page.wait_for_load_state("networkidle", timeout=10000)
+            await self.page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT_MS)
         except Exception:
             pass
-        await self.page.wait_for_timeout(1500)
-        after_text = await self.page.locator("body").inner_text(timeout=5000)
-        response_text = after_text
-        if after_text.startswith(before_text):
-            response_text = after_text[len(before_text) :].strip()
-        if not response_text or response_text == after_text:
+
+        # JS chat UIs (React, etc.) re-render the whole document and stream the
+        # reply in, so the new text is interleaved rather than appended. Poll
+        # until fresh lines appear and stop growing, then diff line-by-line.
+        response_text = ""
+        stable_count = 0
+        for _ in range(RESPONSE_POLL_TICKS):
+            if should_stop():
+                break
+            await self.page.wait_for_timeout(RESPONSE_POLL_INTERVAL_MS)
+            try:
+                after_text = await self.page.locator("body").inner_text(timeout=BODY_READ_TIMEOUT_MS)
+            except Exception:
+                continue
+            new_lines = [
+                line for line in self._significant_lines(after_text, payload)
+                if line not in before_lines
+            ]
+            candidate = "\n".join(new_lines).strip()
+            if candidate and candidate == response_text:
+                stable_count += 1
+                if stable_count >= RESPONSE_STABLE_TICKS:
+                    break
+            else:
+                stable_count = 0
+            response_text = candidate
+
+        if not response_text:
             return 200, (
                 "Browser automation response:\n\n"
                 "No visible bot response was detected after submitting the payload. "
@@ -496,6 +546,17 @@ class BrowserBotSession:
             )
         response_text = response_text.replace(payload, "[submitted payload omitted]")
         return 200, "Browser automation response:\n\n" + response_text
+
+    @staticmethod
+    def _significant_lines(text: str, payload: str) -> list[str]:
+        """Stripped, non-empty lines (in order) that are not just the echoed payload."""
+        payload_norm = payload.strip()
+        lines: list[str] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line and line != payload_norm:
+                lines.append(line)
+        return lines
 
     async def _submit_current_input(self) -> None:
         try:

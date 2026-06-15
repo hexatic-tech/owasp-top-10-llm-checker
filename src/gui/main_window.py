@@ -4,7 +4,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QBrush, QCloseEvent, QColor
 from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -24,15 +25,32 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from src.core import scoring
 from src.core.models import ScanResult
 from src.core.payload_loader import load_payload_cases
 from src.core.report_writer import write_html_report, write_json_report, write_markdown_report, write_reports
 from src.core.scanner import ScannerThread
+from src.core.scoring import security_score
 from src.data.owasp_llm_top10 import OWASP_LLM_TOP10
 from src.gui.widgets import ReadOnlyTextEdit
 
 
 DISCLAIMER = "Use this tool only on systems you own or have explicit permission to test."
+
+DEFAULT_SETTINGS: dict[str, object] = {
+    "timeout_seconds": 30,
+    "delay_between_tests_seconds": 2,
+    "max_crawl_pages": 12,
+    "enable_browser_scan": True,
+}
+
+# Row background tints by canonical category verdict.
+STATUS_COLORS = {
+    scoring.PASS: "#d1e7dd",   # green
+    scoring.FAIL: "#f8d7da",   # red
+    scoring.MIXED: "#ffe0b2",  # orange
+    scoring.ERROR: "#ffe0b2",  # orange (could not evaluate)
+}
 
 
 class MainWindow(QMainWindow):
@@ -43,6 +61,11 @@ class MainWindow(QMainWindow):
         self.results: list[ScanResult] = []
         self.scanner_thread: ScannerThread | None = None
         self.settings = self._load_settings()
+
+        self._spinner_index = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(120)
+        self._spinner_timer.timeout.connect(self._tick_spinner)
 
         self.setWindowTitle("OWASP LLM Top 10 Payload Tester")
         self._build_ui()
@@ -87,7 +110,16 @@ class MainWindow(QMainWindow):
 
         button_row = QHBoxLayout()
         self.start_button = QPushButton("Start Test")
+        self.start_button.setObjectName("startButton")
+        # Lock the width so the animated "Running" spinner can't resize the
+        # button and shift the Stop button left/right while it ticks.
+        start_width = self.start_button.fontMetrics().horizontalAdvance("Running        |") + 36
+        self.start_button.setFixedWidth(start_width)
+        self.stop_button = QPushButton("Stop Test")
+        self.stop_button.setObjectName("stopButton")
+        self.stop_button.setEnabled(False)
         button_row.addWidget(self.start_button)
+        button_row.addWidget(self.stop_button)
         button_row.addStretch(1)
 
         input_layout.addRow("Target website URL", self.url_input)
@@ -157,6 +189,27 @@ class MainWindow(QMainWindow):
             QPushButton {
                 padding: 6px 12px;
             }
+            QPushButton#startButton, QPushButton#startButton:disabled {
+                background: #198754;
+                color: #ffffff;
+                font-weight: 600;
+                border: none;
+                border-radius: 4px;
+                text-align: left;
+                padding-left: 14px;
+                padding-right: 14px;
+            }
+            QPushButton#stopButton {
+                background: #dc3545;
+                color: #ffffff;
+                font-weight: 600;
+                border: none;
+                border-radius: 4px;
+            }
+            QPushButton#stopButton:disabled {
+                background: #e9a3ab;
+                color: #fdecee;
+            }
             QTextEdit, QLineEdit, QListWidget {
                 font-size: 13px;
             }
@@ -166,6 +219,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.category_list.currentRowChanged.connect(self._show_category)
         self.start_button.clicked.connect(self._start_scan)
+        self.stop_button.clicked.connect(self._stop_scan)
         self.export_button.clicked.connect(self._export_reports)
 
     def _show_category(self, row: int) -> None:
@@ -206,6 +260,14 @@ class MainWindow(QMainWindow):
             self._append_log("Scan cancelled before authorization confirmation.")
             return
 
+        selected_category_ids = self._selected_category_ids()
+        if selected_category_ids:
+            self._append_log(
+                f"Selected categories: {', '.join(selected_category_ids)}."
+            )
+        else:
+            self._append_log("No categories selected. Running all OWASP LLM Top 10 tests.")
+
         self.results = []
         self._reset_safety_checklist()
         self.progress.setValue(0)
@@ -224,6 +286,7 @@ class MainWindow(QMainWindow):
             delay_seconds=int(self.settings.get("delay_between_tests_seconds", 2)),
             max_crawl_pages=int(self.settings.get("max_crawl_pages", 12)),
             enable_browser_scan=bool(self.settings.get("enable_browser_scan", True)),
+            selected_category_ids=selected_category_ids,
         )
         self.scanner_thread.log.connect(self._append_log)
         self.scanner_thread.website_status.connect(self._update_website_status)
@@ -234,16 +297,38 @@ class MainWindow(QMainWindow):
         self.scanner_thread.start()
         self._append_log("Scan started.")
 
+    def _selected_category_ids(self) -> list[str]:
+        selected: list[str] = []
+        for row in range(self.category_list.count()):
+            item = self.category_list.item(row)
+            if item.checkState() == Qt.Checked and 0 <= row < len(OWASP_LLM_TOP10):
+                selected.append(OWASP_LLM_TOP10[row]["id"])
+        return selected
+
+    def _stop_scan(self) -> None:
+        if not self.scanner_thread:
+            return
+        self.stop_button.setEnabled(False)
+        self._stop_spinner()
+        self.scanner_thread.stop()
+        self.website_status_label.setText("Website status: Stopping...")
+        self.security_score_label.setText("Security score: Stopping...")
+        self._append_log("Stop requested. Finishing the current step and halting...")
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        thread = self.scanner_thread
+        if thread is not None and thread.isRunning():
+            thread.stop()
+            # Give the cooperative stop a moment to unwind the current step.
+            thread.wait(5000)
+        super().closeEvent(event)
+
     def _record_result(self, result: ScanResult) -> None:
         self.results.append(result)
         self._append_log(f"{result.category_id} / {result.payload_name} completed: {result.result} - {result.reason}")
         row = self._row_for_category(result.category_id)
         if row is not None:
-            item = self.category_list.item(row)
-            base_text = item.data(Qt.UserRole)
-            category_result = self._category_result(result.category_id)
-            item.setText(f"{base_text} - {category_result}")
-            item.setCheckState(Qt.Checked if category_result == "PASS" else Qt.Unchecked)
+            self._apply_category_color(row, result.category_id)
             self.category_list.setCurrentRow(row)
         self._update_security_score()
 
@@ -306,7 +391,33 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool) -> None:
         self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
         self.url_input.setEnabled(not running)
+        if running:
+            self._start_spinner()
+        else:
+            self._stop_spinner()
+
+    _SPINNER_FRAMES = "|/-\\"
+
+    def _running_label(self, frame: str) -> str:
+        # Fixed leading spacing keeps "Running" anchored on the left and the
+        # spinner glyph parked on the right half of the (fixed-width) button.
+        return f"Running        {frame}"
+
+    def _start_spinner(self) -> None:
+        self._spinner_index = 0
+        self.start_button.setText(self._running_label(self._SPINNER_FRAMES[0]))
+        self._spinner_timer.start()
+
+    def _stop_spinner(self) -> None:
+        self._spinner_timer.stop()
+        self.start_button.setText("Start Test")
+
+    def _tick_spinner(self) -> None:
+        frame = self._SPINNER_FRAMES[self._spinner_index % len(self._SPINNER_FRAMES)]
+        self._spinner_index += 1
+        self.start_button.setText(self._running_label(frame))
 
     def _validate_inputs(self, target_url: str) -> bool:
         parsed = urlparse(target_url)
@@ -327,10 +438,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Website check failed", message)
 
     def _reset_safety_checklist(self) -> None:
+        # Reset the result text suffix and color; preserve the user's category selection.
         for row in range(self.category_list.count()):
             item = self.category_list.item(row)
             item.setText(item.data(Qt.UserRole))
-            item.setCheckState(Qt.Unchecked)
+            item.setBackground(QBrush())
 
     def _row_for_category(self, category_id: str) -> int | None:
         for row, category in enumerate(OWASP_LLM_TOP10):
@@ -342,19 +454,16 @@ class MainWindow(QMainWindow):
         matches = [result for result in self.results if result.category_id == category_id]
         return matches[-1] if matches else None
 
-    def _category_result(self, category_id: str) -> str:
-        matches = [result.result for result in self.results if result.category_id == category_id]
-        if not matches:
-            return "Not run"
-        if "FAIL" in matches:
-            return "FAIL"
-        if "WARNING" in matches:
-            return "WARNING"
-        if "ERROR" in matches:
-            return "ERROR"
-        if all(result == "PASS" for result in matches):
-            return "PASS"
-        return matches[-1]
+    def _category_status_for(self, category_id: str) -> str | None:
+        """Canonical verdict for a category, or None if it has no results yet."""
+        statuses = [result.result for result in self.results if result.category_id == category_id]
+        return scoring.category_status(statuses) if statuses else None
+
+    def _apply_category_color(self, row: int, category_id: str) -> None:
+        item = self.category_list.item(row)
+        status = self._category_status_for(category_id)
+        color = STATUS_COLORS.get(status) if status else None
+        item.setBackground(QBrush(QColor(color)) if color else QBrush())
 
     def _auto_download_html_report(self) -> Path:
         downloads_dir = Path.home() / "Downloads"
@@ -375,36 +484,44 @@ class MainWindow(QMainWindow):
         return safe or "website"
 
     def _update_security_score(self, final: bool = False) -> None:
-        category_ids = [category["id"] for category in OWASP_LLM_TOP10]
-        category_results = [self._category_result(category_id) for category_id in category_ids]
-        total = len(category_ids)
-        passed = sum(1 for result in category_results if result == "PASS")
-        failed = sum(1 for result in category_results if result == "FAIL")
-        warnings = sum(1 for result in category_results if result == "WARNING")
-        errors = sum(1 for result in category_results if result == "ERROR")
-        scanned = sum(1 for result in category_results if result != "Not run")
-        if scanned == total and errors == total:
+        total_categories = len(OWASP_LLM_TOP10)
+        scanned_statuses = [
+            status
+            for category in OWASP_LLM_TOP10
+            if (status := self._category_status_for(category["id"])) is not None
+        ]
+        scanned = len(scanned_statuses)
+        score = security_score(scanned_statuses)
+
+        if score.total > 0 and score.errors == score.total:
             self.security_score_label.setText("Security score: Not evaluated (no AI bot/chat endpoint found)")
             self.security_score_label.setStyleSheet("color: #6c757d; font-weight: 700;")
             return
+
         score_text = (
-            f"Security score: {passed}/{total} secure "
-            f"(FAIL {failed}, WARNING {warnings}, ERROR {errors})"
+            f"Security score: {score.display} "
+            f"(FAIL {score.failed}, MIXED {score.mixed}, ERROR {score.errors})"
         )
-        if not final and scanned < total:
-            score_text += f" - scanned {scanned}/{total}"
-        color = "#198754" if passed == total else "#b7791f" if failed == 0 else "#dc3545"
+        if not final and scanned < total_categories:
+            score_text += f" - scanned {scanned}/{total_categories}"
+        if score.total > 0 and score.passed == score.total:
+            color = "#198754"  # all passed
+        elif score.failed > 0:
+            color = "#dc3545"  # at least one outright failure
+        elif score.mixed > 0:
+            color = "#b7791f"  # needs manual review
+        else:
+            color = "#6c757d"  # nothing conclusive yet
         self.security_score_label.setText(score_text)
         self.security_score_label.setStyleSheet(f"color: {color}; font-weight: 700;")
 
     def _load_settings(self) -> dict[str, object]:
+        settings = dict(DEFAULT_SETTINGS)
         settings_path = self.base_dir / "config" / "settings.json"
         try:
-            return json.loads(settings_path.read_text(encoding="utf-8"))
+            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {
-                "timeout_seconds": 30,
-                "delay_between_tests_seconds": 2,
-                "max_crawl_pages": 12,
-                "enable_browser_scan": True,
-            }
+            return settings
+        if isinstance(loaded, dict):
+            settings.update(loaded)
+        return settings
