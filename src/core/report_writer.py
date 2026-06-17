@@ -8,12 +8,12 @@ from src.core import scoring
 from src.core.models import ScanResult, utc_timestamp
 
 
-def write_reports(base_dir: Path, results: list[ScanResult]) -> tuple[Path, Path]:
+def write_reports(base_dir: Path, results: list[ScanResult], report_stem: str = "report") -> tuple[Path, Path]:
     reports_dir = base_dir / "reports"
     reports_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path = reports_dir / f"report_{timestamp}.json"
-    md_path = reports_dir / f"report_{timestamp}.md"
+    json_path = reports_dir / f"{report_stem}_{timestamp}.json"
+    md_path = reports_dir / f"{report_stem}_{timestamp}.md"
 
     write_json_report(json_path, results)
     write_markdown_report(md_path, results)

@@ -365,7 +365,7 @@ class MainWindow(QMainWindow):
         self._set_running(False)
         self.export_button.setEnabled(bool(self.results))
         if self.results:
-            json_path, md_path = write_reports(self.base_dir, self.results)
+            json_path, md_path = write_reports(self.base_dir, self.results, self._report_stem())
             self._append_log(f"Reports saved: {json_path.name}, {md_path.name}")
             html_path = self._save_latest_html_report()
             self._append_log(f"HTML report saved in app reports: {html_path.name}")
@@ -392,7 +392,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No results", "Run a scan before exporting a report.")
             return
 
-        default_path = self.base_dir / "reports" / "owasp_llm_report.html"
+        default_path = self.base_dir / "reports" / f"{self._report_stem()}.html"
         file_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Save report",
@@ -459,7 +459,7 @@ class MainWindow(QMainWindow):
         if output_path.parent == self._reports_dir():
             return output_path
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = self._reports_dir() / f"exported_{self._safe_site_name()}_{timestamp}{suffix or '.html'}"
+        report_path = self._reports_dir() / f"{self._report_stem('exported')}_{timestamp}{suffix or '.html'}"
         if suffix == ".json":
             write_json_report(report_path, self.results)
         elif suffix == ".md":
@@ -470,7 +470,7 @@ class MainWindow(QMainWindow):
 
     def _save_latest_html_report(self) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = self._reports_dir() / f"report_{timestamp}.html"
+        report_path = self._reports_dir() / f"{self._report_stem()}_{timestamp}.html"
         write_html_report(report_path, self.results)
         return report_path
 
@@ -625,6 +625,9 @@ class MainWindow(QMainWindow):
         source = source.lower().removeprefix("www.")
         safe = re.sub(r"[^a-z0-9]+", "_", source).strip("_")
         return safe or "website"
+
+    def _report_stem(self, prefix: str = "owasp_llm_report") -> str:
+        return f"{prefix}_{self._safe_site_name()}"
 
     def _update_security_score(self, final: bool = False) -> None:
         total_categories = len(OWASP_LLM_TOP10)
