@@ -1,7 +1,11 @@
 import json
+import os
 import re
+import subprocess
+import webbrowser
 from datetime import datetime
 from pathlib import Path
+from shutil import which
 from urllib.parse import urlparse
 
 from PySide6.QtCore import Qt, QTimer
@@ -70,6 +74,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("OWASP LLM Top 10 Payload Tester")
         self._build_ui()
         self._connect_signals()
+        self._refresh_report_list()
         self.category_list.setCurrentRow(0)
 
     def _build_ui(self) -> None:
@@ -84,13 +89,26 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         root_layout.addWidget(splitter, stretch=1)
 
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_panel.setMinimumWidth(280)
+
         self.category_list = QListWidget()
-        self.category_list.setMinimumWidth(280)
         for category in OWASP_LLM_TOP10:
             item = QListWidgetItem(f"{category['id']}: {category['name']}", self.category_list)
             item.setData(Qt.UserRole, f"{category['id']}: {category['name']}")
             item.setCheckState(Qt.Unchecked)
-        splitter.addWidget(self.category_list)
+        left_layout.addWidget(QLabel("OWASP tests"))
+        left_layout.addWidget(self.category_list, stretch=3)
+
+        self.report_list = QListWidget()
+        self.report_list.setAlternatingRowColors(True)
+        self.report_title = QLabel("Saved reports")
+        self.report_title.setObjectName("reportTitle")
+        left_layout.addWidget(self.report_title)
+        left_layout.addWidget(self.report_list, stretch=2)
+        splitter.addWidget(left_panel)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -186,6 +204,10 @@ class MainWindow(QMainWindow):
                 color: #495057;
                 font-weight: 700;
             }
+            QLabel#reportTitle {
+                margin-top: 8px;
+                font-weight: 700;
+            }
             QPushButton {
                 padding: 6px 12px;
             }
@@ -218,6 +240,8 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.category_list.currentRowChanged.connect(self._show_category)
+        self.report_list.itemClicked.connect(self._open_selected_report)
+        self.report_list.itemDoubleClicked.connect(self._open_selected_report)
         self.start_button.clicked.connect(self._start_scan)
         self.stop_button.clicked.connect(self._stop_scan)
         self.export_button.clicked.connect(self._export_reports)
@@ -343,13 +367,16 @@ class MainWindow(QMainWindow):
         if self.results:
             json_path, md_path = write_reports(self.base_dir, self.results)
             self._append_log(f"Reports saved: {json_path.name}, {md_path.name}")
+            html_path = self._save_latest_html_report()
+            self._append_log(f"HTML report saved in app reports: {html_path.name}")
             download_path = self._auto_download_html_report()
             self._append_log(f"HTML report automatically saved: {download_path}")
+            self._refresh_report_list(html_path)
             self._update_security_score(final=True)
             QMessageBox.information(
                 self,
                 "Report downloaded",
-                f"The scan is complete and the HTML report was saved automatically:\n{download_path}",
+                f"The scan is complete and the HTML report was saved automatically:\n{download_path}\n\nIt was also saved in the app report list:\n{html_path}",
             )
         self._append_log("Scan finished.")
         self.scanner_thread = None
@@ -386,8 +413,124 @@ class MainWindow(QMainWindow):
             output_path = output_path if output_path.suffix.lower() == ".html" else output_path.with_suffix(".html")
             write_html_report(output_path, self.results)
 
+        sidebar_copy = self._save_report_copy(output_path)
+        self._refresh_report_list(sidebar_copy)
         QMessageBox.information(self, "Report saved", f"Saved:\n{output_path}")
         self._append_log(f"Report saved: {output_path}")
+        self._append_log(f"Report added to sidebar: {sidebar_copy}")
+
+    def _reports_dir(self) -> Path:
+        reports_dir = self.base_dir / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        return reports_dir
+
+    def _refresh_report_list(self, selected_path: Path | None = None) -> None:
+        self.report_list.clear()
+        reports = sorted(
+            (
+                path
+                for path in self._reports_dir().iterdir()
+                if path.is_file() and path.suffix.lower() == ".html"
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in reports:
+            item = QListWidgetItem(path.name, self.report_list)
+            item.setData(Qt.UserRole, str(path))
+
+        title = "Saved reports"
+        if self.report_list.count():
+            title = f"Saved reports ({self.report_list.count()})"
+        self.report_title.setText(title)
+
+        if selected_path is None:
+            return
+
+        selected_value = str(selected_path)
+        for row in range(self.report_list.count()):
+            item = self.report_list.item(row)
+            if item.data(Qt.UserRole) == selected_value:
+                self.report_list.setCurrentRow(row)
+                break
+
+    def _save_report_copy(self, output_path: Path) -> Path:
+        suffix = output_path.suffix.lower()
+        if output_path.parent == self._reports_dir():
+            return output_path
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = self._reports_dir() / f"exported_{self._safe_site_name()}_{timestamp}{suffix or '.html'}"
+        if suffix == ".json":
+            write_json_report(report_path, self.results)
+        elif suffix == ".md":
+            write_markdown_report(report_path, self.results)
+        else:
+            write_html_report(report_path, self.results)
+        return report_path
+
+    def _save_latest_html_report(self) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = self._reports_dir() / f"report_{timestamp}.html"
+        write_html_report(report_path, self.results)
+        return report_path
+
+    def _open_selected_report(self, item: QListWidgetItem) -> None:
+        report_path = Path(item.data(Qt.UserRole))
+        if not report_path.exists():
+            QMessageBox.warning(self, "Missing report", f"Could not find:\n{report_path}")
+            self._refresh_report_list()
+            return
+        opened_with = self._open_report_in_browser(report_path)
+        if not opened_with:
+            QMessageBox.warning(
+                self,
+                "Open failed",
+                "Could not open the report in a browser. Please check your browser configuration.",
+            )
+
+    def _open_report_in_browser(self, report_path: Path) -> str | None:
+        report_url = report_path.resolve().as_uri()
+
+        if webbrowser.open_new_tab(report_url):
+            self._append_log(f"Opened report in browser: default browser - {report_path}")
+            return "default browser"
+
+        for browser in self._browser_candidates():
+            browser_path = which(browser)
+            if browser_path is None:
+                continue
+            try:
+                subprocess.Popen([browser_path, report_url])
+                self._append_log(f"Opened report in browser: {browser} - {report_path}")
+                return browser
+            except OSError:
+                continue
+        return None
+
+    def _browser_candidates(self) -> list[str]:
+        browsers: list[str] = []
+
+        configured = os.environ.get("BROWSER", "")
+        for entry in configured.split(os.pathsep):
+            candidate = entry.strip()
+            if candidate and candidate not in browsers:
+                browsers.append(candidate)
+
+        browsers.extend([
+            "brave-browser",
+            "brave",
+            "google-chrome",
+            "google-chrome-stable",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "chromium",
+            "chromium-browser",
+            "firefox",
+            "floorp",
+            "opera",
+            "vivaldi",
+        ])
+        return browsers
 
     def _set_running(self, running: bool) -> None:
         self.start_button.setEnabled(not running)
